@@ -23,6 +23,10 @@ services:
       # global defaults for the test hooks (per-request overrides exist):
       # CANCEL_SEND_DELAY_MS: "0"
       # CLEANUP_DELAY_MS: "0"
+      # row-level access verification (/rls/verify):
+      # RLS_VERIFY_MAX_CONCURRENCY: "10"   # dedicated short-lived connections
+      # RLS_VERIFY_ACQUIRE_TIMEOUT_S: "30"
+      # RLS_STATEMENT_TIMEOUT_MS: "10000"
     depends_on:
       db:
         condition: service_healthy

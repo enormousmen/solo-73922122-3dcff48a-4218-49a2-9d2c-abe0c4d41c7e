@@ -1,8 +1,12 @@
-# 共享诊断 SQL 服务（FastAPI + PostgreSQL）
+# 共享诊断 SQL 服务（FastAPI + PostgreSQL 16）
 
 值班数据库工程师共用的诊断执行服务：提交至多 10 条可信 SQL，在**固定复用的两条
 PostgreSQL 连接**之一上按序自动提交执行；支持逐句结果查询、取消未结束的单；
 每单结束后清理会话状态（SET、临时表、会话级咨询锁等），清理失败则淘汰连接并补建。
+
+另有**行级访问核验 API**（`POST /rls/verify`）：给定 schema、普通表、角色名和
+单列整数主键值，核实该角色以自身数据库身份读取该行时实际会得到什么（存在性、
+SELECT 权限、RLS 可见性），只回结论不回行内容，且完全不占用两条诊断长连接。
 
 ## 架构
 
@@ -57,6 +61,7 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
 | GET | `/jobs` | 最近的单（摘要列表） |
 | GET | `/jobs/{id}` | 单详情 + 逐句结果（状态/列/行/rowcount/耗时/错误） |
 | POST | `/jobs/{id}/cancel` | 取消未结束的单（202 受理；已结束返回 409） |
+| POST | `/rls/verify` | 行级访问核验（存在性 / 无 SELECT 权限 / RLS 隐藏 / 可见 / 未知） |
 | GET | `/pool` | 两条连接的状态（idle/busy/cleaning/reconnecting、代数、清理失败数） |
 | GET | `/health` | 存活检查 |
 | GET | `/docs` | Swagger UI |
@@ -97,6 +102,65 @@ curl -XPOST localhost:8000/jobs -H 'content-type: application/json' -d '{
 `pg_advisory_unlock_all()`。清理失败 → 关闭并淘汰该连接，原地补建新连接
 （`/pool` 可见 `generation` 与 `cleanups_failed` 递增）。
 
+## 行级访问核验（POST /rls/verify）
+
+值班场景：某角色报告"看不到某条租户记录"，需要确认数据库实际会给出什么。
+入参为 schema、**普通表**名、角色名、**单列整数主键**（smallint/integer/bigint）
+的值；响应只给结论，**绝不返回任何行内容**。
+
+```bash
+curl -XPOST localhost:8000/rls/verify -H 'content-type: application/json' -d '{
+  "schema_name": "tenant_demo",
+  "table_name": "tenant_rows",
+  "role_name": "app_reader",
+  "pk_value": 123
+}'
+```
+
+### 结论（`outcome`）
+
+| 结论 | 含义 |
+|---|---|
+| `row_not_found` | 特权身份确认该主键行根本不存在 |
+| `no_read_privilege` | 行存在，但该角色没有表级 SELECT（或读取被权限拒绝） |
+| `hidden_by_rls` | 行存在且有 SELECT，但行级安全策略把该行过滤掉了 |
+| `visible` | 以该角色身份读取，行可见 |
+| `unknown` | 目标或身份无法确认（见 `reason`），不给出任何误导性结论 |
+
+`unknown` 的 `reason` 包括：`table_missing`、`not_plain_table`（视图/外部表/
+分区表/序列等）、`no_primary_key`、`composite_primary_key`、`pk_not_integer`、
+`role_missing`、`cannot_assume_role`、`privilege_unconfirmable`、
+`existence_unconfirmable`、`insufficient_privileges`、`backend_unavailable`、
+`backend_error`、`busy`。
+即使结论为 `unknown`，已确认的事实（表的 RLS/OWNER 状态、角色属性、主键列等）
+仍会在响应中如实给出。
+
+### 正确性保证
+
+- **两次读取、同一份数据、同一张表**：每次核验开一条**独立短连接**，在一个
+  `BEGIN ISOLATION LEVEL REPEATABLE READ` 事务内完成全部目录查询和两次读取，
+  因此特权存在性读取与角色读取针对**同一个快照**。
+- **真实角色身份**：角色读取前执行 `SET LOCAL ROLE <role>`，权限与 RLS 完全按
+  PostgreSQL 对该角色的真实判定执行。表所有者默认绕过 RLS、`BYPASSRLS` 角色
+  绕过 RLS、`ALTER TABLE ... FORCE ROW LEVEL SECURITY` 后所有者也受策略约束——
+  这些都不做特判，直接报告数据库的真实读取结果。
+- **先确认存在，再以角色身份重读**：超级用户登录身份先独立确认行是否存在，
+  因此 `row_not_found` 与"被策略隐藏"不会混淆；登录角色不是超级用户时返回
+  `unknown(insufficient_privileges)`。
+- **不留状态**：核验连接在请求结束前提交/回滚并关闭，`SET LOCAL` 随事务结束
+  自动撤销；不创建、不删除任何角色；不遗留事务。核验期间带
+  `statement_timeout`（默认 10s，`RLS_STATEMENT_TIMEOUT_MS` 可调）。
+- **不占用诊断长连接**：核验连接与两条池化连接完全独立，并发上限由
+  `RLS_VERIFY_MAX_CONCURRENCY`（默认 10）限制，超限返回 `unknown(busy)`；
+  原任务的执行、排队与取消不受影响。
+
+### 前置条件
+
+- 服务的 `DATABASE_URL` 登录角色须为**超级用户**（用于独立的存在性读取与
+  `SET ROLE`）。Docker Compose 中的 `postgres` 角色满足该条件。
+- 目标表必须是普通表（`relkind = 'r'`），且有单列整数主键；临时表、视图、
+  外部表、分区表、无主键/复合主键/非整数主键均返回 `unknown` 并说明原因。
+
 ## 测试钩子（可控停顿/故障注入）
 
 | 钩子 | 位置 | 作用 |
@@ -113,13 +177,15 @@ pip install -r requirements-dev.txt
 pytest tests/test_sqlguard.py        # 纯单元测试（SQL 守卫），无需数据库
 # 集成测试需要运行中的服务与数据库：
 API_BASE=http://localhost:8000 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/diag \
-  pytest tests/test_integration.py
+  pytest tests/test_integration.py tests/test_rls_verify.py
 ```
 
 集成测试覆盖：按序自动提交与逐句结果、行数截断、失败即停、参数校验、
 会话状态不泄漏（SET/临时表/咨询锁/预备语句，含失败单）、取消运行中/排队中的单、
 迟到取消（409 与延迟发送不误伤下一单）、慢 SQL/慢清理不阻塞另一连接、
-清理失败淘汰并补建连接（钩子注入 + `pg_terminate_backend` 真实杀连接两种）。
+清理失败淘汰并补建连接（钩子注入 + `pg_terminate_backend` 真实杀连接两种）、
+行级访问核验（行不存在 / 无 SELECT / RLS 隐藏 / 可见 / 各类 `unknown`、
+表所有者与 FORCE RLS、BYPASSRLS、独立连接不占用池、任务执行与取消并行可用）。
 
 > 注：PostgreSQL 的语句取消依赖向后端进程投递 SIGINT。在禁止进程间信号的
 > 沙箱里，"中断正在执行的语句"无法生效（`pg_terminate_backend` 同样无效），

@@ -37,3 +37,19 @@ MAX_HOOK_DELAY_MS: int = int(os.environ.get("MAX_HOOK_DELAY_MS", "120000"))
 CANCEL_SEND_WAIT_S: float = float(os.environ.get("CANCEL_SEND_WAIT_S", "180"))
 
 CONNECT_TIMEOUT_S: int = int(os.environ.get("CONNECT_TIMEOUT_S", "10"))
+
+# Row-level access verification (/rls/verify).
+# Each verification opens its own short-lived dedicated connection (never one
+# of the two pooled diagnostic connections). The semaphore caps how many may
+# run at once; callers that cannot acquire a slot get an 'unknown' verdict.
+RLS_VERIFY_MAX_CONCURRENCY: int = int(
+    os.environ.get("RLS_VERIFY_MAX_CONCURRENCY", "10")
+)
+RLS_VERIFY_ACQUIRE_TIMEOUT_S: float = float(
+    os.environ.get("RLS_VERIFY_ACQUIRE_TIMEOUT_S", "30")
+)
+# Statement timeout applied inside a verification transaction so a locked or
+# slow table cannot pin a dedicated connection indefinitely.
+RLS_STATEMENT_TIMEOUT_MS: int = int(
+    os.environ.get("RLS_STATEMENT_TIMEOUT_MS", "10000")
+)

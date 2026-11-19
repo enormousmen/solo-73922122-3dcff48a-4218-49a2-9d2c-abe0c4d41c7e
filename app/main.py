@@ -6,6 +6,7 @@ POST /jobs                 submit 1..10 statements (queued, 202)
 GET  /jobs                 list recent jobs
 GET  /jobs/{id}            job detail incl. per-statement results
 POST /jobs/{id}/cancel     cancel a queued/running job (202) ; 409 if finished
+POST /rls/verify           row-level access verdict for one row and role
 GET  /pool                 state of the two pooled connections
 GET  /health               liveness
 GET  /docs                 Swagger UI
@@ -25,10 +26,13 @@ from .models import (
     JobDetail,
     JobSummary,
     PoolStatus,
+    RLSVerifyRequest,
+    RLSVerifyResponse,
     SubmitRequest,
     SubmitResponse,
 )
 from .pool import Pool
+from .rls import RLSVerifier
 from .sqlguard import SqlRejected, check_statements
 from .store import TERMINAL_STATES, Job, JobStore, utcnow
 
@@ -40,6 +44,7 @@ log = logging.getLogger("diag.api")
 
 store = JobStore(capacity=config.JOB_HISTORY)
 pool = Pool(store)
+rls_verifier = RLSVerifier()
 
 
 @asynccontextmanager
@@ -56,14 +61,17 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Shared Diagnostic SQL Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Shared diagnostic SQL endpoint for on-call DB engineers. "
         "Jobs of up to 10 trusted statements run sequentially in autocommit "
         "mode on a fixed pool of two reused PostgreSQL connections. "
         "Session state (SET, temp tables, advisory locks, ...) is cleaned "
         "after every job; explicit transaction control is rejected; "
-        "unfinished jobs can be cancelled."
+        "unfinished jobs can be cancelled. "
+        "POST /rls/verify independently checks what one database role "
+        "actually sees when reading a single table row (existence, SELECT "
+        "privilege, RLS visibility), using its own short-lived connection."
     ),
     lifespan=lifespan,
 )
@@ -177,3 +185,31 @@ def cancel_job(job_id: str, req: CancelRequest | None = None):
 @app.get("/pool", response_model=PoolStatus)
 def pool_status():
     return pool.status()
+
+
+@app.post("/rls/verify", response_model=RLSVerifyResponse)
+def verify_row_level_access(req: RLSVerifyRequest):
+    """Verify what a given role actually gets when reading one row.
+
+    First confirms whether the pk row really exists (privileged read), then
+    re-reads the same row under the role's own identity (SET LOCAL ROLE).
+    Returns a verdict only -- never any row contents. Both reads run in one
+    REPEATABLE READ transaction on a dedicated short-lived connection, so
+    neither the diagnostic pool nor job execution/cancellation is affected.
+    """
+    result = rls_verifier.verify(
+        schema_name=req.schema_name,
+        table_name=req.table_name,
+        role_name=req.role_name,
+        pk_value=req.pk_value,
+    )
+    log.info(
+        "rls verify %s.%s pk=%s role=%s -> %s (%s)",
+        req.schema_name,
+        req.table_name,
+        req.pk_value,
+        req.role_name,
+        result["outcome"],
+        result.get("reason"),
+    )
+    return result

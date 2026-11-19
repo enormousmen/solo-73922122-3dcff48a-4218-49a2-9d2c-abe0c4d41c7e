@@ -111,3 +111,86 @@ class PoolStatus(BaseModel):
     size: int
     queue_depth: int
     connections: list[ConnectionStatus]
+
+
+# ---------------------------------------------------------------------- RLS
+
+
+class RLSVerifyRequest(BaseModel):
+    schema_name: str = Field(
+        min_length=1,
+        max_length=63,
+        description="Schema of the target plain table (e.g. 'tenant_demo').",
+    )
+    table_name: str = Field(
+        min_length=1,
+        max_length=63,
+        description="Plain table name (relkind 'r'). Views, foreign tables, "
+        "sequences and temporary tables are rejected as 'unknown'.",
+    )
+    role_name: str = Field(
+        min_length=1,
+        max_length=63,
+        description="Database role whose read access is verified. The check "
+        "runs with SET LOCAL ROLE to this role, so permissions and RLS are "
+        "evaluated exactly as the role itself.",
+    )
+    pk_value: int = Field(
+        description="Value of the table's single-column integer primary key "
+        "(smallint/integer/bigint) identifying the target row.",
+    )
+
+
+class RLSTargetInfo(BaseModel):
+    schema_name: str
+    table_name: str
+    primary_key_column: str | None
+    pk_value: int
+    is_plain_table: bool
+
+
+class RLSRoleInfo(BaseModel):
+    name: str
+    exists: bool | None
+    is_superuser: bool | None
+    bypass_rls: bool | None
+    is_table_owner: bool | None
+
+
+class RLSTableInfo(BaseModel):
+    row_security_enabled: bool | None
+    force_row_security: bool | None
+    owner: str | None
+
+
+class RLSVerifyResponse(BaseModel):
+    # row_not_found | no_read_privilege | hidden_by_rls | visible | unknown
+    outcome: str = Field(
+        description="row_not_found: the pk row does not exist. "
+        "no_read_privilege: the row exists but the role lacks SELECT. "
+        "hidden_by_rls: the row exists but an RLS policy filters it out. "
+        "visible: the role's SELECT returns the row. "
+        "unknown: the target or the role identity could not be established; "
+        "see 'reason'. Row contents are never returned."
+    )
+    reason: str | None = Field(
+        default=None,
+        description="Machine-readable explanation, populated for 'unknown': "
+        "table_missing, not_plain_table, no_primary_key, composite_primary_key, "
+        "pk_not_integer, role_missing, cannot_assume_role, "
+        "privilege_unconfirmable, existence_unconfirmable, "
+        "insufficient_privileges, backend_unavailable, backend_error, busy.",
+    )
+    detail: str = Field(description="Short human-readable explanation.")
+    target: RLSTargetInfo
+    role: RLSRoleInfo
+    table: RLSTableInfo
+    same_snapshot: bool = Field(
+        description="True when both reads ran in one REPEATABLE READ "
+        "transaction and therefore against one identical snapshot of the "
+        "same table."
+    )
+    dedicated_connection: bool = Field(
+        description="True when the check used its own short-lived connection "
+        "rather than one of the two diagnostic pool connections."
+    )
